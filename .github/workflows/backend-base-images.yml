@@ -1,0 +1,131 @@
+name: Prepare RackBook backend base images
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rackbook-backend-base-images
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Export official backend base images
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          output_dir="backend-base-images-amd64"
+
+          go_source="docker.io/library/golang:1.27.1-trixie"
+          go_archive="golang-1.27.1-trixie-amd64.tar.gz"
+
+          debian_source="docker.io/library/debian:13.7-slim"
+          debian_archive="debian-13.7-slim-amd64.tar.gz"
+
+          mkdir -p -- "$output_dir"
+          output_dir=$(cd -- "$output_dir" && pwd)
+
+          for file in "$go_archive" "$debian_archive"; do
+            if [[ -e "$output_dir/$file" ]]; then
+              printf 'Output already exists: %s\n' "$file" >&2
+              exit 1
+            fi
+          done
+
+          export_image() {
+            local source_image="$1"
+            local archive_name="$2"
+            local prefix="$3"
+
+            printf 'Pulling %s...\n' "$source_image"
+            docker pull --platform=linux/amd64 "$source_image"
+
+            platform=$(docker image inspect \
+              --format '{{.Os}}/{{.Architecture}}' \
+              "$source_image")
+
+            [[ "$platform" == "linux/amd64" ]] || {
+              printf 'Unexpected platform for %s: %s\n' \
+                "$source_image" "$platform" >&2
+              exit 1
+            }
+
+            image_id=$(docker image inspect \
+              --format '{{.Id}}' \
+              "$source_image")
+
+            source_digest=$(docker image inspect \
+              --format '{{index .RepoDigests 0}}' \
+              "$source_image")
+
+            docker image save "$source_image" \
+              | gzip -1 \
+              > "$output_dir/$archive_name"
+
+            printf '%s\n' "$image_id" \
+              > "$output_dir/${prefix}_IMAGE_ID.txt"
+
+            printf \
+              'source=%s\nsource_digest=%s\nplatform=%s\nimage_id=%s\ncreated_utc=%s\n' \
+              "$source_image" \
+              "$source_digest" \
+              "$platform" \
+              "$image_id" \
+              "$(date -u +%FT%TZ)" \
+              > "$output_dir/${prefix}_SOURCE.txt"
+          }
+
+          export_image \
+            "$go_source" \
+            "$go_archive" \
+            "GOLANG"
+
+          export_image \
+            "$debian_source" \
+            "$debian_archive" \
+            "DEBIAN"
+
+          (
+            cd -- "$output_dir"
+            sha256sum \
+              "$go_archive" \
+              "$debian_archive" \
+              GOLANG_IMAGE_ID.txt \
+              GOLANG_SOURCE.txt \
+              DEBIAN_IMAGE_ID.txt \
+              DEBIAN_SOURCE.txt \
+              > SHA256SUMS
+          )
+
+          printf 'Backend base image files ready: %s\n' "$output_dir"
+
+      - name: Upload files to a draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          release_tag="backend-base-images-amd64-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          gh release create "$release_tag" \
+            --target "$GITHUB_SHA" \
+            --draft \
+            --title "RackBook backend base images amd64" \
+            --notes "Official Go 1.27.1 trixie and Debian 13.7 slim linux/amd64 images exported for offline RackBook Backend builds. SOURCE files record upstream digests and image IDs. Contains no RackBook source or secrets. Download all assets. This draft is visible to repository maintainers; publish only if you intend public distribution." \
+            backend-base-images-amd64/golang-1.27.1-trixie-amd64.tar.gz \
+            backend-base-images-amd64/debian-13.7-slim-amd64.tar.gz \
+            backend-base-images-amd64/GOLANG_IMAGE_ID.txt \
+            backend-base-images-amd64/GOLANG_SOURCE.txt \
+            backend-base-images-amd64/DEBIAN_IMAGE_ID.txt \
+            backend-base-images-amd64/DEBIAN_SOURCE.txt \
+            backend-base-images-amd64/SHA256SUMS
